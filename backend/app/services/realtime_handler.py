@@ -132,8 +132,9 @@ class RealtimeHandler:
         1. Parse tool arguments safely
         2. Validate with strict schema
         3. Check for duplicates
-        4. Execute Zapier webhook
-        5. Return structured result
+        4. Save to database
+        5. Execute Zapier webhook
+        6. Return structured result
         """
         
         # STEP 1: Parse arguments safely
@@ -170,18 +171,75 @@ class RealtimeHandler:
                 ],
             }
         
-        # STEP 3: Execute via Zapier
         intent = validation_result.intent
-        execution_result = await self.execution_service.execute_calendar_intent(intent)
         
-        if execution_result.is_duplicate:
-            logger.info(f"🔄 Duplicate appointment, returning existing")
+        # STEP 3: Check for duplicates
+        if self.execution_service.was_executed(intent.intent_id):
+            logger.info(f"🔄 Duplicate appointment detected: {intent.intent_id}")
             return {
                 "success": True,
                 "is_duplicate": True,
                 "message": "This appointment was already created.",
-                "appointment_id": execution_result.intent_id,
+                "appointment_id": intent.intent_id,
             }
+        
+        # STEP 4: Save to database
+        db_appointment_id = None
+        try:
+            from app.core.database import AsyncSessionLocal
+            from app.models.appointment import Appointment
+            
+            async with AsyncSessionLocal() as db:
+                # Parse datetime
+                start_dt = datetime.fromisoformat(intent.start_time.replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(intent.end_time.replace("Z", "+00:00"))
+                
+                appointment = Appointment(
+                    id=intent.intent_id,  # Use intent_id for idempotency
+                    call_id=call_id,
+                    org_id=org_id or "org_demo_001",
+                    title=intent.title,
+                    description=intent.description,
+                    start_time=start_dt,
+                    end_time=end_dt,
+                    timezone=intent.timezone,
+                    attendee_email=intent.attendees[0],
+                    attendee_name=parsed_args.get("attendee_name"),
+                    status="scheduled",
+                )
+                db.add(appointment)
+                await db.commit()
+                await db.refresh(appointment)
+                db_appointment_id = appointment.id
+                logger.info(f"💾 Appointment saved to database: {db_appointment_id}")
+        except Exception as e:
+            logger.error(f"❌ Failed to save appointment to database: {e}")
+            # Continue with Zapier even if DB fails
+        
+        # STEP 5: Execute via Zapier
+        execution_result = await self.execution_service.execute_calendar_intent(intent)
+        
+        # Update database with Zapier result
+        if db_appointment_id and execution_result.success:
+            try:
+                from app.core.database import AsyncSessionLocal
+                from app.models.appointment import Appointment
+                from sqlalchemy import select
+                
+                async with AsyncSessionLocal() as db:
+                    result = await db.execute(
+                        select(Appointment).where(Appointment.id == db_appointment_id)
+                    )
+                    apt = result.scalar_one_or_none()
+                    if apt:
+                        apt.status = "confirmed"
+                        apt.calendar_invite_sent = True
+                        apt.meta_data = apt.meta_data or {}
+                        apt.meta_data["zapier_success"] = True
+                        await db.commit()
+                        logger.info(f"✅ Updated appointment status in database")
+            except Exception as e:
+                logger.error(f"❌ Failed to update appointment status: {e}")
         
         if not execution_result.success:
             logger.error(f"❌ Zapier execution failed: {execution_result.error}")
@@ -189,15 +247,16 @@ class RealtimeHandler:
                 "success": False,
                 "error": execution_result.error or "Failed to create appointment",
                 "should_retry": True,
-                "clarification": "I was unable to create the appointment. Would you like to try again?",
+                "clarification": "I was unable to send the calendar invite. The appointment was saved but please try again.",
+                "appointment_id": db_appointment_id,
             }
         
-        # STEP 4: Return success
+        # STEP 6: Return success
         logger.info(f"✅ Appointment created successfully: {intent.intent_id}")
         return {
             "success": True,
             "message": f"Appointment created and confirmation email sent to {intent.attendees[0]}",
-            "appointment_id": intent.intent_id,
+            "appointment_id": db_appointment_id or intent.intent_id,
             "calendar_link": execution_result.zapier_response.get("calendar_link"),
             "email_sent": True,
             "attendee_email": intent.attendees[0],
