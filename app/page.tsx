@@ -23,7 +23,7 @@ export default function Dashboard() {
   const [isLoadingCalls, setIsLoadingCalls] = useState(true)
 
   useEffect(() => {
-    // Fetch recent calls from GET /api/calls
+    // Fetch most recent calls from GET /api/calls
     const fetchCalls = async () => {
       try {
         setIsLoadingCalls(true)
